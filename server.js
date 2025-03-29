@@ -4,56 +4,93 @@ const multer = require('multer');
 const pdf = require('pdf-parse');
 const cors = require('cors');
 const axios = require('axios');
-const morgan = require('morgan');
 const fs = require('fs');
 const path = require('path');
-const bodyParser = require('body-parser');
+
 const app = express();
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(morgan('dev'));
-app.use(bodyParser.json({ limit: '10mb' }));
-app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
+// Enhanced Middleware
+app.use(cors({
+  origin: '*' // For development, restrict in production
+}));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = './uploads';
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir);
-    }
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    cb(null, `${Date.now()}-${file.originalname}`);
-  }
-});
-
-const upload = multer({ 
-  storage: storage,
+// Improved File Upload Configuration
+const upload = multer({
+  storage: multer.memoryStorage(), // Use memory storage for better performance
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'application/pdf') {
       cb(null, true);
     } else {
-      cb(new Error('Only PDF files are allowed!'), false);
+      cb(new Error('Only PDF files are allowed (max 10MB)'), false);
     }
   },
   limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit
+    fileSize: 10 * 1024 * 1024 // 10MB
   }
 });
 
-// Health check endpoint
+// Enhanced Health Check
 app.get('/', (req, res) => {
-  res.status(200).json({ 
-    status: 'running',
-    message: 'PDF Processing Service is operational'
+  res.json({ 
+    status: 'ready',
+    endpoints: {
+      extractText: 'POST /extract-text',
+      translate: 'POST /translate',
+      combined: 'POST /process-pdf' // New combined endpoint
+    },
+    limits: 'PDFs up to 10MB'
   });
 });
 
-// PDF text extraction endpoint
+// New Combined Endpoint (Handles both extraction and translation)
+app.post('/process-pdf', upload.single('pdf'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'No PDF file uploaded' 
+      });
+    }
+
+    // 1. Extract text from PDF buffer (no temp file needed)
+    const data = await pdf(req.file.buffer);
+    let extractedText = data.text;
+
+    // 2. Auto-translate if text > 50 characters
+    let translation = '';
+    if (extractedText.length > 50) {
+      const translated = await translateText(
+        extractedText.substring(0, 500), // Limit for free API
+        'auto', // Auto-detect source language
+        'en'    // Default to English
+      );
+      translation = translated;
+    }
+
+    res.json({
+      success: true,
+      metadata: {
+        pages: data.numpages,
+        textLength: extractedText.length
+      },
+      extractedText: extractedText.substring(0, 1000) + (extractedText.length > 1000 ? '...' : ''), // Preview
+      translatedText: translation,
+      downloadLink: null // Can implement later
+    });
+
+  } catch (err) {
+    console.error('Processing error:', err);
+    res.status(500).json({
+      success: false,
+      error: 'PDF processing failed',
+      details: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
+  }
+});
+
+// Improved Text Extraction Endpoint
 app.post('/extract-text', upload.single('pdf'), async (req, res) => {
   try {
     if (!req.file) {
@@ -63,39 +100,25 @@ app.post('/extract-text', upload.single('pdf'), async (req, res) => {
       });
     }
 
-    // Read the uploaded PDF file
-    const dataBuffer = fs.readFileSync(req.file.path);
+    // Process directly from memory
+    const data = await pdf(req.file.buffer);
     
-    // Parse PDF and extract text
-    const data = await pdf(dataBuffer);
-    
-    // Clean up - delete the uploaded file after processing
-    fs.unlinkSync(req.file.path);
-
-    res.status(200).json({ 
+    res.json({ 
       success: true,
-      text: data.text 
+      text: data.text,
+      pages: data.numpages,
+      textLength: data.text.length
     });
-  } catch (err) {
-    console.error('PDF processing error:', err);
-    
-    // Clean up file if something went wrong
-    if (req.file && fs.existsSync(req.file.path)) {
-      fs.unlinkSync(req.file.path);
-    }
 
-    res.status(500).json({ 
-      success: false,
-      error: 'Failed to process PDF',
-      details: err.message 
-    });
+  } catch (err) {
+    handleError(res, err, 'Text extraction failed');
   }
 });
 
-// Translation endpoint
+// Enhanced Translation Endpoint
 app.post('/translate', async (req, res) => {
   try {
-    const { text, fromLang = 'en', toLang = 'es' } = req.body;
+    const { text, fromLang = 'auto', toLang = 'en' } = req.body;
     
     if (!text || typeof text !== 'string') {
       return res.status(400).json({ 
@@ -104,49 +127,59 @@ app.post('/translate', async (req, res) => {
       });
     }
 
-    // Limit text length for free API
-    const textToTranslate = text.length > 500 ? text.substring(0, 500) : text;
-    
-    const response = await axios.get('https://api.mymemory.translated.net/get', {
-      params: {
-        q: textToTranslate,
-        langpair: `${fromLang}|${toLang}`
-      },
-      timeout: 10000 // 10 seconds timeout
+    const result = await translateText(text, fromLang, toLang);
+    res.json({
+      success: true,
+      translatedText: result,
+      characters: text.length
     });
 
-    if (response.data && response.data.responseData) {
-      res.status(200).json({
-        success: true,
-        translatedText: response.data.responseData.translatedText
-      });
-    } else {
-      throw new Error('Invalid response from translation service');
-    }
   } catch (err) {
-    console.error('Translation error:', err);
-    res.status(500).json({ 
-      success: false,
-      error: 'Translation failed',
-      details: err.message 
-    });
+    handleError(res, err, 'Translation failed');
   }
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('Server error:', err);
-  res.status(500).json({ 
-    success: false,
-    error: 'Internal server error',
-    details: err.message 
+// Helper Functions
+async function translateText(text, fromLang, toLang) {
+  const response = await axios.get('https://api.mymemory.translated.net/get', {
+    params: {
+      q: text.substring(0, 500), // Free tier limit
+      langpair: `${fromLang}|${toLang}`,
+      de: 'your-email@example.com' // Required for MyMemory
+    },
+    timeout: 5000
   });
-});
 
+  if (!response.data?.responseData?.translatedText) {
+    throw new Error(response.data?.responseStatus || 'Translation service error');
+  }
+  return response.data.responseData.translatedText;
+}
+
+function handleError(res, err, context) {
+  console.error(context, err);
+  res.status(500).json({
+    success: false,
+    error: context,
+    details: process.env.NODE_ENV === 'development' ? {
+      message: err.message,
+      stack: err.stack
+    } : undefined
+  });
+}
+
+// Server Start
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`API endpoints:`);
-  console.log(`- POST http://localhost:${PORT}/extract-text`);
-  console.log(`- POST http://localhost:${PORT}/translate`);
+  console.log('Endpoints:');
+  console.log(`http://localhost:${PORT}/process-pdf`);
+  console.log(`http://localhost:${PORT}/extract-text`);
+  console.log(`http://localhost:${PORT}/translate`);
+});
+
+// Process cleanup
+process.on('SIGTERM', () => {
+  console.log('Server shutting down');
+  process.exit(0);
 });
