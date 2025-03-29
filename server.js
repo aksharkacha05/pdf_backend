@@ -64,7 +64,7 @@ app.post('/process-pdf', upload.single('pdf'), async (req, res) => {
       const translated = await translateText(
         extractedText.substring(0, 500), // Limit for free API
         'auto', // Auto-detect source language
-        'en'    // Default to English
+        'gu'    // Default to English
       );
       translation = translated;
     }
